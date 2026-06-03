@@ -53,26 +53,26 @@ void loop()
   disp.update();
   net.update();
   
-  const uint64_t currentTimeMS = millis();
+  const uint64_t now = millis();
 
-  static uint64_t previousTimeMS1 = 0;
-  if ((currentTimeMS - previousTimeMS1) >= 500)
+  static uint64_t t1 = 0;
+  if ((now - t1) >= 500)
   {
-    previousTimeMS1 = currentTimeMS;
+    t1 = now;
     blinkLEDFunc(def_pin_D1);
   }
 
-  static uint64_t previousTimeMS2 = 0;
-  if ((currentTimeMS - previousTimeMS2) >= 1000)
+  static uint64_t t2 = 0;
+  if ((now - t2) >= 1000)
   {
-    previousTimeMS2 = currentTimeMS;
+    t2 = now;
     blinkLEDFunc(def_pin_D2);
   }
 
-  static uint64_t previousTimeMS3 = 0;  
-  if ((currentTimeMS - previousTimeMS3) >= 50)
+  static uint64_t t3 = 0;  
+  if ((now - t3) >= 50)
   {
-    previousTimeMS3 = currentTimeMS;
+    t3 = now;
     managerInputFunc();
   } 
 }

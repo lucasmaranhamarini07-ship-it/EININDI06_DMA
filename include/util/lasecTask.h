@@ -22,16 +22,11 @@
 
 #if defined(ARDUINO_ARCH_ESP32)
 #include <freertos/FreeRTOS.h>
-
-// timerBegin(freq_Hz) é a API do Arduino-ESP32 >= 3.0.0 (espressif32 >= 6.0.0).
-// Com espressif32 v5.x (arduino-esp32 v2.x) a assinatura é timerBegin(num, div, up).
-// Atualize platformio.ini: platform = espressif32 @ ^6.0.0
-#  ifndef ESP_ARDUINO_VERSION_MAJOR
-#    error "lasecTask.h: não foi possível detectar a versão do Arduino-ESP32."
-#  elif ESP_ARDUINO_VERSION_MAJOR < 3
-#    error "lasecTask.h: requer Arduino-ESP32 >= 3.0.0. " \
-           "Defina: platform = espressif32 @ ^6.0.0 no platformio.ini"
-#  endif
+#include <esp_idf_version.h>
+// Duas APIs de timer coexistem no ecossistema ESP32 Arduino:
+//   API nova (ESP-IDF v5 / Arduino-ESP32 v3.x): timerBegin(freq), timerAlarm()
+//   API velha (ESP-IDF v4 / Arduino-ESP32 v2.x): timerBegin(num,div,up), timerAlarmWrite()
+// Usamos ESP_IDF_VERSION_MAJOR para selecionar a correta em tempo de compilação.
 
 #elif defined(ARDUINO_ARCH_AVR)
 #include <avr/interrupt.h>
@@ -68,10 +63,22 @@ public:
 
 #if defined(ARDUINO_ARCH_ESP32)
         if (_timer != nullptr) { timerEnd(_timer); _timer = nullptr; }
+#  if ESP_IDF_VERSION_MAJOR >= 5
+        // API nova — ESP-IDF v5 / Arduino-ESP32 v3.x
         _timer = timerBegin(frequency);
         if (_timer == nullptr) return false;
         timerAttachInterrupt(_timer, &lasecTask::_isr);
         timerAlarm(_timer, 1, true, 0);
+#  else
+        // API velha — ESP-IDF v4 / Arduino-ESP32 v2.x (pioarduino)
+        // divider=80: 80 MHz ÷ 80 = 1 MHz → 1 tick = 1 µs
+        // alarme em 1.000.000/frequency µs = 1 período
+        _timer = timerBegin(0, 80, true);
+        if (_timer == nullptr) return false;
+        timerAttachInterrupt(_timer, &lasecTask::_isr, true);
+        timerAlarmWrite(_timer, 1000000UL / frequency, true);
+        timerAlarmEnable(_timer);
+#  endif
         return true;
 #elif defined(ARDUINO_ARCH_AVR)
         return _setupAvrTimer2(frequency);
@@ -99,7 +106,11 @@ public:
 
         bool ok = false;
         if (_taskCount < MaxTasks) {
-            _tasks[_taskCount] = {0, limitTicks, task};
+            // Atribuição explícita: compatível com C++11 (structs com default-member-init
+            // não são agregados em C++11, então {x,y,z} não funciona como assignment)
+            _tasks[_taskCount].counter = 0;
+            _tasks[_taskCount].limit   = limitTicks;
+            _tasks[_taskCount].cb      = task;
             ++_taskCount;
             ok = true;
         }
