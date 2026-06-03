@@ -1,6 +1,11 @@
-# II1P06 — ADC com DMA no ESP32-S3
+# II1P06 — ADC com DMA e por Interrupção no ESP32
 
-Projeto PlatformIO que demonstra leitura de ADC a alta frequência usando o driver **adc_continuous** do ESP-IDF v5, sem intervenção da CPU a cada amostra. Inclui a biblioteca `AdcDmaEsp` (`include/services/AdcDmaEsp.h`) e um firmware completo em `src/dma.cpp`.
+Projeto PlatformIO com dois firmwares que demonstram estratégias diferentes de aquisição de dados analógicos:
+
+| Firmware | Hardware | Abordagem | Arquivo |
+|----------|----------|-----------|---------|
+| `esp32s3-dma` | ESP32-S3 | ADC contínuo via DMA — CPU zero por amostra | `src/dma.cpp` |
+| `esp32dev-irq` | ESP32 | ADS1115 via interrupção de timer — CPU acorda por amostra | `src/interrupt.cpp` |
 
 ---
 
@@ -10,13 +15,16 @@ Projeto PlatformIO que demonstra leitura de ADC a alta frequência usando o driv
 |------|--------------|
 | PlatformIO | qualquer |
 | `espressif32` (platform) | `^6.0.0` (Arduino-ESP32 v3.x + ESP-IDF v5) |
-| Hardware | ESP32-S3 (ex.: ESP32-S3-DevKitC-1) |
+| Hardware (`esp32s3-dma`) | ESP32-S3 (ex.: ESP32-S3-DevKitC-1) |
+| Hardware (`esp32dev-irq`) | ESP32 clássico + ADS1115 via I2C (SDA=21, SCL=22) |
 
-> O driver `adc_continuous` e o formato de saída TYPE2 são exclusivos do **ESP32-S3** e ESP32-S2. O env `esp32dev` do `platformio.ini` usa I2S e é para ESP32 clássico; use o env `esp32s3-dma` para este projeto.
+> O driver `adc_continuous` e o formato TYPE2 são exclusivos do **ESP32-S3/S2**. Para ESP32 clássico use o firmware de interrupção (`interrupt.cpp`).
 
 ---
 
 ## Configuração rápida (`platformio.ini`)
+
+### ESP32-S3 + DMA
 
 ```ini
 [env:esp32s3-dma]
@@ -32,6 +40,19 @@ build_flags =
 ```
 
 Para gravar via USB nativa do S3 deixe as duas flags `ARDUINO_USB_*` ativas. Para gravar via OTA descomente `upload_protocol = espota` e `upload_port`.
+
+### ESP32 + Interrupção
+
+```ini
+[env:esp32dev-irq]
+platform  = espressif32 @ ^6.0.0
+board     = esp32dev
+framework = arduino
+build_src_filter = +<interrupt.cpp>
+build_flags =
+    -DKIT_ID=1
+    -DKIT_HOSTNAME='"iikit1"'
+```
 
 ---
 
@@ -249,15 +270,93 @@ A função `wserial.plot(nome, dt_ms, array, len, unidade)` serializa o array no
 
 ---
 
+## Como o firmware `interrupt.cpp` funciona
+
+Arquivo: `src/interrupt.cpp` — env: `esp32dev-irq`
+
+### Setup
+
+```
+wserial.begin()           → Serial 115200 + socket UDP na porta 47268
+disp.begin(SDA=21,SCL=22) → display OLED SSD1306
+net.begin("iikit1")       → WiFi (WiFiManager) + mDNS + OTA
+ads1115.begin()           → ADC externo ADS1115 via I2C
+timerBegin(20)            → timer de hardware a 20 Hz (1 tick = 50 ms)
+timerAlarm(..., 1, true)  → alarme a cada tick; dispara onTimer() via ISR
+ltask.attach(cb, 1000)    → atualiza display a cada 1000 ms
+```
+
+### Padrão ISR → flag → loop()
+
+```
+Timer HW (20 Hz)
+    │
+    ▼  ISR: onTimer()            ← IRAM_ATTR, contexto de interrupção
+    seta _sampleReady = true     ← única coisa feita aqui
+    │
+    ▼  loop()                    ← contexto normal
+    if (!_sampleReady) return    ← CPU livre para wserial/disp/net/ltask
+    _sampleReady = false         ← limpa ANTES de ler (não perde próximo tick)
+    ads1115.read() × 2 canais    ← ~18 ms bloqueante no I2C
+    wserial.plot() × 2           ← envia via UDP (ou Serial)
+```
+
+### Por que `volatile`?
+
+A ISR e o `loop()` rodam em contextos distintos (interrupção vs. thread principal). Sem `volatile`, o compilador pode otimizar `_sampleReady` para um registrador e o `loop()` nunca vê a atualização feita pela ISR. `volatile` força releitura da RAM a cada acesso.
+
+### Por que `IRAM_ATTR`?
+
+A flash do ESP32 pode ficar temporariamente indisponível enquanto o Wi-Fi ou o OTA usam o barramento de flash. Se a ISR residir na flash nesse momento, a CPU tenta executar código inacessível → exceção (guru meditation). `IRAM_ATTR` move a função para a RAM interna, garantindo execução sempre disponível.
+
+### Por que limpar a flag **antes** de ler?
+
+```
+_sampleReady = false;   // ← aqui
+_pot1 = ads1115.read(); // ~9 ms bloqueante
+_pot2 = ads1115.read(); // ~9 ms bloqueante
+```
+
+A leitura do ADS1115 leva ~18 ms. Se o timer dispara durante esse tempo (lembra: 50 ms de período, 18 ms de leitura — há margem, mas a lógica deve ser correta para qualquer configuração), a ISR seta `_sampleReady = true` novamente. Se limpássemos **depois**, esse segundo sinal seria sobrescrito para `false` e a amostra seria perdida.
+
+### Cadência de amostras
+
+| Parâmetro | Valor |
+|-----------|-------|
+| Timer | 20 Hz |
+| Período entre amostras | 50 ms |
+| Tempo de leitura (2 canais × 9 ms) | ~18 ms |
+| CPU livre por ciclo | ~32 ms |
+| Taxa efetiva por canal | 20 Hz |
+
+---
+
+## DMA vs. Interrupção — quando usar cada abordagem
+
+| | Interrupção (`interrupt.cpp`) | DMA (`dma.cpp`) |
+|-|-------------------------------|-----------------|
+| **Hardware** | ESP32 clássico | ESP32-S3 |
+| **Sensor** | ADS1115 (externo, I2C) | ADC interno |
+| **Taxa típica** | até ~50 Hz | até 83 kHz |
+| **CPU por amostra** | acordada 1× | zero |
+| **CPU por frame (64 am.)** | 64× | 1× |
+| **Complexidade** | simples | maior (driver ESP-IDF) |
+| **Adequado para** | sensores lentos, I2C/SPI | sinais rápidos, áudio, vibração |
+
+> **Regra prática:** se a taxa desejada cabe no `loop()` sem stress, use interrupção. Se a taxa exige que a CPU fique fora do caminho crítico, use DMA.
+
+---
+
 ## Serviços auxiliares utilizados
 
-| Instância global | Header | Função |
-|-----------------|--------|--------|
-| `adcDma` | `services/AdcDmaEsp.h` | ADC contínuo com DMA |
-| `wserial` | `services/wserial.h` | Serial/UDP + plotter |
-| `disp` | `services/display_ssd1306.h` | OLED SSD1306 via I2C |
-| `net` | `services/lasecNet.h` | WiFi (WiFiManager) + mDNS + OTA |
-| `ltask` | `util/lasecTask.h` | Escalonador cooperativo por timer |
+| Instância global | Header | Usado em | Função |
+|-----------------|--------|----------|--------|
+| `adcDma` | `services/AdcDmaEsp.h` | `dma.cpp` | ADC contínuo com DMA (ESP32-S3) |
+| `ads1115` | `services/ads1115.h` | `interrupt.cpp` | ADC externo ADS1115 via I2C |
+| `wserial` | `services/wserial.h` | ambos | Serial/UDP + plotter |
+| `disp` | `services/display_ssd1306.h` | ambos | OLED SSD1306 via I2C |
+| `net` | `services/lasecNet.h` | ambos | WiFi (WiFiManager) + mDNS + OTA |
+| `ltask` | `util/lasecTask.h` | ambos | Escalonador cooperativo por timer |
 
 ---
 
@@ -265,3 +364,4 @@ A função `wserial.plot(nome, dt_ms, array, len, unidade)` serializa o array no
 
 - [ESP-IDF: ADC Continuous Mode](https://docs.espressif.com/projects/esp-idf/en/latest/esp32s3/api-reference/peripherals/adc_continuous.html)
 - [Arduino-ESP32 v3.x ADC API](https://docs.espressif.com/projects/arduino-esp32/en/latest/api/adc.html)
+- [Arduino-ESP32 v3.x Timer API](https://docs.espressif.com/projects/arduino-esp32/en/latest/api/timer.html)
